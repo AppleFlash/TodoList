@@ -15,7 +15,6 @@ const getTask = "/getTask/{taskId}"
 const addTask = "/create"
 const register = "/register"
 const login = "/login"
-const refresh = "/refresh"
 
 func main() {
 	repo := repositories.NewTodoRepository()
@@ -25,12 +24,27 @@ func main() {
 	handlers := handlers.NewTodoHandler(service, authService)
 
 	r := mux.NewRouter()
-	r.HandleFunc(getTask, handlers.GetTask).Methods("GET")
+
+	// r.HandleFunc(getTask, handlers.GetTask).Methods("GET")
 	r.HandleFunc(addTask, handlers.CreateTask).Methods("POST")
 	r.HandleFunc(register, handlers.Register).Methods("POST")
 	r.HandleFunc(login, handlers.Login).Methods("POST")
-	r.HandleFunc(refresh, handlers.Refresh).Methods("POST")
+	r.Use()
+
+	createRoute(r, getTask, "GET", handlers.ProtectedMiddleware, handlers.GetTask)
 
 	fmt.Println("Starting server...")
 	log.Fatal(http.ListenAndServe(":8080", r))
+}
+
+func createRoute(
+	r *mux.Router,
+	endpoint string,
+	method string,
+	middleware mux.MiddlewareFunc,
+	handler func(w http.ResponseWriter, r *http.Request),
+) {
+	protected := r.PathPrefix(endpoint).Subrouter()
+	protected.Use(middleware)
+	protected.HandleFunc("", handler).Methods(method)
 }

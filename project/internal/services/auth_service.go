@@ -9,7 +9,10 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
+
+// MARK: Models
 
 type AccessData struct {
 	AccessToken  string
@@ -21,12 +24,31 @@ type LoginData struct {
 	Access AccessData
 }
 
+// MARK: Service
+
+type Claims struct {
+	Username  string `json:"username"`
+	SessionID string `json:"session_id"`
+
+	jwt.RegisteredClaims
+}
+
 type AuthService interface {
 	Register(ctx context.Context, creds models.Credentionals) error
 	Login(ctx context.Context, creds models.Credentionals) (LoginData, error)
-	Validate(ctx context.Context, tokenString string) (*Claims, error)
-	Refresh(ctx context.Context, refreshToken string) (AccessData, error)
+	Validate(ctx context.Context, accessData AccessData) (AccessData, error)
 }
+
+// MARK: Package vers
+
+var (
+	accessDuration  = 15 * time.Second
+	refreshDuration = 24 * 7 * time.Hour
+	secretKey       = []byte("secret_key")
+	sessions        = make(map[string]string)
+)
+
+// MARK: Implementation
 
 type authServiceImp struct {
 	repo repositories.AuthRepository
@@ -46,13 +68,6 @@ func (s *authServiceImp) Register(ctx context.Context, creds models.Credentional
 	return nil
 }
 
-type Claims struct {
-	Username string `json:"username"`
-	jwt.RegisteredClaims
-}
-
-var secretKey = []byte("app_secret_key")
-
 func (s *authServiceImp) Login(ctx context.Context, creds models.Credentionals) (LoginData, error) {
 	user, error := s.repo.Login(creds)
 	if error != nil {
@@ -63,30 +78,65 @@ func (s *authServiceImp) Login(ctx context.Context, creds models.Credentionals) 
 		return LoginData{}, errors.New("unauthorized")
 	}
 
-	access, error := s.generateJWT(creds.Login, 5*time.Second)
+	// Создаём уникальный иденитфикатор сессии, который используется и access и refresh токенах.
+	// Новый session_id создаётся при логине и при пересоздании refresh токена
+	id := uuid.NewString()
+	accessData, error := s.generateNewAccess(creds.Login, id)
 	if error != nil {
-		return LoginData{}, errors.New("access token error")
+		return LoginData{}, error
 	}
 
-	refresh, error := s.generateJWT(creds.Login, 720*time.Hour)
-	if error != nil {
-		return LoginData{}, errors.New("access token error")
-	}
+	sessions[id] = accessData.RefreshToken
 
 	return LoginData{
-		User: user,
-		Access: AccessData{
-			AccessToken:  access,
-			RefreshToken: refresh,
-		},
+		User:   user,
+		Access: accessData,
 	}, nil
 }
 
-func (s *authServiceImp) generateJWT(login string, duration time.Duration) (string, error) {
+func (s *authServiceImp) Validate(ctx context.Context, accessData AccessData) (AccessData, error) {
+	accessToken, err := parseToken(accessData.AccessToken)
+	accessClaims := accessToken.Claims.(*Claims)
+	if err != nil && !errors.Is(err, jwt.ErrTokenExpired) {
+		return AccessData{}, err
+	}
+
+	storedRefresh := sessions[accessClaims.SessionID]
+	if storedRefresh != accessData.RefreshToken {
+		return AccessData{}, errors.New("unauthorized")
+	}
+
+	// Access token живой
+	if accessToken.Valid {
+		return accessData, nil
+	} else { // Access token протух
+		// Проверяем актуальность refresh token
+		refreshToken, err := parseToken(accessData.RefreshToken)
+		if err != nil {
+			// Refresh token протух - пользователь не акторизован
+			return AccessData{}, err
+		}
+		if refreshToken.Valid {
+			newAccessData, error := s.generateNewAccess(accessClaims.Username, accessClaims.SessionID)
+			if error != nil {
+				return AccessData{}, error
+			}
+			sessions[accessClaims.SessionID] = newAccessData.RefreshToken
+			return newAccessData, nil
+		} else {
+			return AccessData{}, errors.New("unauthorized")
+		}
+	}
+}
+
+// MARK: Private
+
+func (s *authServiceImp) generateJWT(login string, id string, duration time.Duration) (string, error) {
 	accessTime := jwt.NewNumericDate(time.Now().Add(duration))
 
 	claims := Claims{
-		Username: login,
+		Username:  login,
+		SessionID: id,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: accessTime,
 		},
@@ -101,42 +151,24 @@ func (s *authServiceImp) generateJWT(login string, duration time.Duration) (stri
 	return signed, nil
 }
 
-func (s *authServiceImp) Validate(ctx context.Context, tokenString string) (*Claims, error) {
-	claims := &Claims{}
-	token, err := jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+func parseToken(tokenString string) (*jwt.Token, error) {
+	// Функция для проверки подписи токена
+	return jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+		// Проверяем, что метод подписи совпадает
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
 		return secretKey, nil
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	if token.Valid {
-		return claims, nil
-	} else {
-		return nil, errors.New("token invalid")
-	}
 }
 
-func (s *authServiceImp) Refresh(ctx context.Context, refreshToken string) (AccessData, error) {
-	claims, error := s.Validate(ctx, refreshToken)
-	if error != nil {
-		return AccessData{}, errors.New("token in invalid")
-	}
-
-	issuer := claims.Username
-	if !s.repo.IsUserExists(issuer) {
-		return AccessData{}, errors.New("token in invalid")
-	}
-
-	access, error := s.generateJWT(issuer, 3*time.Minute)
+func (s *authServiceImp) generateNewAccess(login string, sessionID string) (AccessData, error) {
+	access, error := s.generateJWT(login, sessionID, accessDuration)
 	if error != nil {
 		return AccessData{}, errors.New("access token error")
 	}
 
-	refresh, error := s.generateJWT(issuer, 720*time.Hour)
+	refresh, error := s.generateJWT(login, sessionID, refreshDuration)
 	if error != nil {
 		return AccessData{}, errors.New("access token error")
 	}

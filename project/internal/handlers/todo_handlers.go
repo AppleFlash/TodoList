@@ -86,23 +86,35 @@ func (h *TodoHandler) Login(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Refresh-Token", data.Access.RefreshToken)
 }
 
-func (h *TodoHandler) Refresh(w http.ResponseWriter, r *http.Request) {
-	token := r.Header.Get("Authorization")
-	if token == "" {
-		http.Error(w, "Refresh token is required", http.StatusBadRequest)
-		return
-	}
+func (h *TodoHandler) ProtectedMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accessToken := r.Header.Get("Authorization")
+		if accessToken == "" {
+			http.Error(w, "Access token is required", http.StatusBadRequest)
+			return
+		}
 
-	if len(token) > 7 && strings.ToUpper(token[:7]) == "Bearer " {
-		token = token[7:]
-	}
+		if len(accessToken) > 7 && strings.ToUpper(accessToken[:7]) == "BEARER " {
+			accessToken = accessToken[7:]
+		}
 
-	data, error := h.authService.Refresh(r.Context(), token)
-	if error != nil {
-		http.Error(w, error.Error(), http.StatusUnauthorized)
-		return
-	}
+		refreshToken := r.Header.Get("X-Refresh-Token")
+		if refreshToken == "" {
+			http.Error(w, "Refresh token is required", http.StatusBadRequest)
+			return
+		}
 
-	w.Header().Add("Authorization", "Bearer "+data.AccessToken)
-	w.Header().Set("X-Refresh-Token", data.RefreshToken)
+		accessData, error := h.authService.Validate(r.Context(), services.AccessData{
+			AccessToken:  accessToken,
+			RefreshToken: refreshToken,
+		})
+		if error != nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		w.Header().Add("Authorization", "Bearer "+accessData.AccessToken)
+		w.Header().Set("X-Refresh-Token", accessData.RefreshToken)
+		next.ServeHTTP(w, r)
+	})
 }
