@@ -42,7 +42,7 @@ type AuthService interface {
 // MARK: Package vers
 
 var (
-	accessDuration  = 15 * time.Second
+	accessDuration  = 15 * time.Minute
 	refreshDuration = 24 * 7 * time.Hour
 	secretKey       = []byte("secret_key")
 	sessions        = make(map[string]string)
